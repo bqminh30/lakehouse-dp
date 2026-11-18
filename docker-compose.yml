@@ -1,0 +1,193 @@
+services:
+  # ==============================================================================
+  # 1. MinIO: S3-compatible Object Storage for Lakehouse files (Parquet & Metadata)
+  # ==============================================================================
+  minio:
+    image: chainguard/minio:latest
+    container_name: lakehouse-minio
+    restart: unless-stopped
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-password123}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - lakehouse-net
+
+  # MinIO Bucket Auto-Provisioning
+  minio-init:
+    build:
+      context: ./docker/minio
+      dockerfile: Dockerfile
+    container_name: lakehouse-minio-init
+    depends_on:
+      - minio
+    volumes:
+      - ./docker/minio/init.sh:/init.sh:ro
+    entrypoint: ["/bin/sh", "/init.sh"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-password123}
+      MINIO_BUCKET: ${MINIO_BUCKET:-warehouse}
+    networks:
+      - lakehouse-net
+
+  # ==============================================================================
+  # 2. PostgreSQL: OLTP Source Database
+  # ==============================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: lakehouse-postgres
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-lakehouse_source}
+    volumes:
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-lakehouse_source}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lakehouse-net
+
+  # ==============================================================================
+  # 3. Apache Iceberg REST Catalog: Central catalog for tables and metadata
+  # ==============================================================================
+  iceberg-rest:
+    image: tabulario/iceberg-rest:0.4.0
+    container_name: lakehouse-iceberg-rest
+    restart: unless-stopped
+    ports:
+      - "${ICEBERG_REST_PORT:-8181}:8181"
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-admin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-password123}
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: ${ICEBERG_WAREHOUSE:-s3://warehouse/}
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - lakehouse-net
+
+  # ==============================================================================
+  # 4. Apache Spark: Standalone Cluster (Master & Worker)
+  # ==============================================================================
+  spark-master:
+    build:
+      context: ./docker/spark
+      dockerfile: Dockerfile
+    image: lakehouse-spark:3.5.1
+    container_name: lakehouse-spark-master
+    restart: unless-stopped
+    ports:
+      - "${SPARK_MASTER_PORT:-7077}:7077"
+      - "${SPARK_MASTER_WEBUI_PORT:-8082}:8080"
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master --ip 0.0.0.0 --port 7077 --webui-port 8080
+    volumes:
+      - ./pipeline:/opt/spark/pipeline
+    depends_on:
+      iceberg-rest:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    networks:
+      - lakehouse-net
+
+  spark-worker:
+    image: lakehouse-spark:3.5.1
+    container_name: lakehouse-spark-worker
+    restart: unless-stopped
+    ports:
+      - "${SPARK_WORKER_WEBUI_PORT:-8083}:8081"
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_CORES=${SPARK_WORKER_CORES:-2}
+      - SPARK_WORKER_MEMORY=${SPARK_WORKER_MEMORY:-2g}
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077 --webui-port 8081
+    volumes:
+      - ./pipeline:/opt/spark/pipeline
+    depends_on:
+      - spark-master
+    networks:
+      - lakehouse-net
+
+  # ==============================================================================
+  # 5. ClickHouse: OLAP Analytical Database (Fast Serving Layer)
+  # ==============================================================================
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: lakehouse-clickhouse
+    restart: unless-stopped
+    ports:
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+      - "${CLICKHOUSE_NATIVE_PORT:-9002}:9000"
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse123}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-analytics}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - ./docker/clickhouse/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+      - clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lakehouse-net
+
+  # ==============================================================================
+  # 6. Trino: Distributed SQL Query Engine for Iceberg & Cross-source queries
+  # ==============================================================================
+  trino:
+    image: trinodb/trino:444
+    container_name: lakehouse-trino
+    restart: unless-stopped
+    ports:
+      - "${TRINO_PORT:-8080}:8080"
+    volumes:
+      - ./docker/trino/catalog:/etc/trino/catalog:ro
+    depends_on:
+      iceberg-rest:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    networks:
+      - lakehouse-net
+
+volumes:
+  minio_data:
+  postgres_data:
+  clickhouse_data:
+
+networks:
+  lakehouse-net:
+    driver: bridge
